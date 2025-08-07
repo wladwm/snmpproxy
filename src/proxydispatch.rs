@@ -633,12 +633,6 @@ impl SNMPProxyDispatcher {
             let rhost = host.read();
             (rhost.key.hostsocket, rhost.key.community.clone())
         };
-        // simulate
-        let mut hto = host_to;
-        let hip = host_to.ip().octets();
-        hto.set_ip(Ipv4Addr::new(198, hip[1], hip[2], hip[3]));
-        debug!("Change session from {} to {}", host_to, hto);
-        // ...
         let session = Arc::new(tokio::sync::Mutex::new(
             self.socket
                 .session(hto /* host_to */, &community, 10, 2)
