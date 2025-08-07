@@ -16,9 +16,6 @@ impl Dur {
     pub const fn from_secs(s: u64) -> Dur {
         Dur(Duration::new(s, 0))
     }
-    pub fn from_secs_f64(s: f64) -> Dur {
-        Dur(Duration::from_secs_f64(s))
-    }
     fn fromstr(s: &str) -> Result<Dur, std::num::ParseFloatError> {
         let mut d = std::time::Duration::new(0, 0);
         let mut n = 0u64;

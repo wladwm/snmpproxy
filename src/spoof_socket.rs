@@ -88,20 +88,6 @@ fn cut8(a: usize) -> usize {
     }
 }
 impl SpoofSocket {
-    pub fn from_socket(socket: UdpSocket) -> SpoofSocket {
-        SpoofSocket {
-            socket,
-            ident: std::sync::atomic::AtomicU16::new(1),
-            mtu: 1500,
-        }
-    }
-    pub fn with_mtu(self, mtu: u16) -> SpoofSocket {
-        SpoofSocket {
-            socket: self.socket,
-            ident: std::sync::atomic::AtomicU16::new(1),
-            mtu,
-        }
-    }
     pub async fn bind(cfg: &crate::config::SocketConfig) -> Result<SpoofSocket> {
         let mut sock2 = Socket::new(Domain::IPV4, Type::RAW, Some(socket2::Protocol::UDP))
             .context("SpoofSocket::bind")?;
