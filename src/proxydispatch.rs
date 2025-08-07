@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::hostdata::*;
 use anyhow::Result;
 use bytes::Bytes;
-use futures::StreamExt;
 
 use snmp::{asn1, AsnReader, SnmpMessageType};
 use std::collections::HashMap;
@@ -93,13 +92,6 @@ impl SNMPProxyDispatcher {
             return Err(snmp::SnmpError::ValueOutOfRange.into());
         }
 
-        if error_status != 0 || error_index != 0 {
-            warn!(
-                "Error status={} index={} from {} to {}",
-                error_status, error_index, host_from, host_to
-            );
-            return Ok(());
-        }
         let now = Instant::now();
         let hkey = HostKey::new(host_to, Bytes::copy_from_slice(community));
 
