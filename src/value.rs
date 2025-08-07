@@ -24,7 +24,8 @@ impl<const N: usize> Octets<N> {
             }
         } else {
             let mut rest = Vec::with_capacity(src.len());
-            rest.clone_from_slice(src);
+            rest.resize(src.len(), 0);
+            rest.copy_from_slice(src);
             Octets::Long {
                 len: src.len(),
                 rest: rest.into_boxed_slice(),
