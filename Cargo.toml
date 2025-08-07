@@ -25,7 +25,7 @@ anyhow = "1.0.98"
 socket2 = "0.6.0"
 parking_lot = "0.12.4"
 clap = { version="4.1.1", features = ["derive"] }
-snmp = { path = "../rust-snmp" }
+snmp = { git="https://github.com/wladwm/rust-snmp.git" }
 
 
 [target.'cfg(unix)'.dependencies]
