@@ -179,7 +179,7 @@ impl std::str::FromStr for SocketConfig {
 }
 
 #[derive(Parser)]
-#[command(author ="Vladimir Melnikov <wlad.w.m@gmail.com>", version = "0.1.1", about = "Queries hosts from CDN mysql RDBMS and writes statistics to YATS TSDB", long_about = None)]
+#[command(author ="Vladimir Melnikov <wlad.w.m@gmail.com>", version = "0.1.0", about = "It is a transparent caching proxy that intercepts requests to network devices and responds to monitoring systems instead of them", long_about = None)]
 pub struct Config {
     #[arg(
         long,
