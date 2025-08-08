@@ -199,7 +199,7 @@ pub struct Config {
     #[arg(long, help = "Cached values life time", default_value = "5m")]
     pub cache_value_lifetime: Dur,
     #[arg(long, help = "Host auto-ignore duration", default_value = "15m")]
-    pub blacklist_duration: Dur,
+    pub ignore_duration: Dur,
     #[arg(long, help = "SNMP query to device timeout", default_value = "30s")]
     pub snmp_timeout: Dur,
     #[arg(long, help = "SNMP retries count", default_value_t = 3)]
@@ -221,7 +221,7 @@ impl std::default::Default for Config {
             response: Default::default(),
             query: Default::default(),
             cache_value_lifetime: Dur::from_secs(600),
-            blacklist_duration: Dur::from_secs(3600),
+            ignore_duration: Dur::from_secs(3600),
             snmp_timeout: Dur::from_secs(10),
             snmp_repeat: 3,
             max_parallel_queries_per_host: 100,

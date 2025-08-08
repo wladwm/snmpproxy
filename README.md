@@ -37,7 +37,7 @@ Configuration can be done via CLI options:
 * --response  - Response spoofed socket configuration, [ip[:port]][@device/fibno] - where from snmpproxy will send spoofed responses to monitorings
 * --query     - Device query socket configuration, [ip[:port]][@device/fibno] - where from snmpproxy will send queries to real devices
 * --cache-value-lifetime - Cached values life time [default: 5m] - time to cache values
-* --blacklist-duration   - Host auto-ignore duration [default: 15m] - time to ignore queries from monitoring, when it queries non-accessible device
+* --ignore-duration   - Host auto-ignore duration [default: 15m] - time to ignore queries from monitoring, when it queries non-accessible device
 * --snmp-timeout         - SNMP query to device timeout [default: 30s] - time to wait for reply from device
 * --snmp-repeat          - SNMP retries count [default: 3] - how many tries snmpproxy does to query device
 * --max-parallel-queries-per-host - Maximum parallel queries per host [default: 100] - when single monitoring system floods, further queries will silently ignored

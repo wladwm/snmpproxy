@@ -16,6 +16,16 @@ impl HostKey {
         }
     }
 }
+impl std::fmt::Display for HostKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "({} {})",
+            self.hostsocket,
+            String::from_utf8_lossy(&self.community)
+        )
+    }
+}
 
 pub struct Query {
     pub src: SocketAddrV4,

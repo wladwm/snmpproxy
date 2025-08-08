@@ -2,6 +2,10 @@ use crate::config::Config;
 use crate::hostdata::*;
 use anyhow::Result;
 use bytes::Bytes;
+#[cfg(unix)]
+use std::os::unix::io::{FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 
 use snmp::{asn1, AsnReader, SnmpMessageType};
 use std::collections::HashMap;
@@ -27,21 +31,51 @@ pub struct SNMPProxyDispatcher {
             ),
         >,
     >,
-    pub blacklist: parking_lot::RwLock<HashMap<HostKey, Instant>>,
+    pub ignorelist: parking_lot::RwLock<HashMap<HostKey, Instant>>,
     pub socket: snmp::tokio_socket::SNMPSocket,
 }
 
 impl SNMPProxyDispatcher {
     pub async fn new(cfg: Arc<Config>, cancel: CancellationToken) -> Result<SNMPProxyDispatcher> {
         let send_socket = crate::spoof_socket::SpoofSocket::bind(&cfg.response).await?;
-        //todo!("handle cfg.query");
-        let socket = snmp::tokio_socket::SNMPSocket::new().await?;
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        #[cfg(target_os = "linux")]
+        if let Some(dv) = cfg.query.bind_device.as_ref() {
+            socket.bind_device(Some(dv.as_bytes()))?;
+        }
+        #[cfg(target_os = "freebsd")]
+        if let Some(fib) = cfg.query.fib {
+            socket.set_fib(fib)?;
+        }
+        if cfg.query.bind_address != Ipv4Addr::UNSPECIFIED || cfg.query.bind_port != 0 {
+            let address = socket2::SockAddr::from(std::net::SocketAddrV4::new(
+                cfg.query.bind_address,
+                cfg.query.bind_port,
+            ));
+            socket.bind(&address)?;
+        }
+        socket.set_nonblocking(true)?;
+        let stdsocket;
+        #[cfg(windows)]
+        {
+            stdsocket = unsafe { std::net::UdpSocket::from_raw_socket(socket.into_raw_socket()) };
+        }
+        #[cfg(unix)]
+        {
+            stdsocket = unsafe { std::net::UdpSocket::from_raw_fd(socket.into_raw_fd()) };
+        }
+        let udpsocket = tokio::net::UdpSocket::from_std(stdsocket)?;
+        let socket = snmp::tokio_socket::SNMPSocket::from_socket(udpsocket);
         Ok(SNMPProxyDispatcher {
             cfg,
             cancel,
             send_socket,
             hosts: parking_lot::RwLock::new(HashMap::new()),
-            blacklist: parking_lot::RwLock::new(HashMap::new()),
+            ignorelist: parking_lot::RwLock::new(HashMap::new()),
             socket,
         })
     }
@@ -57,7 +91,7 @@ impl SNMPProxyDispatcher {
         let version = rdr.read_asn_integer()?;
         if !(0..=1).contains(&version) {
             warn!(
-                "Unsupported version {} from {} to {}",
+                "Unsupported SNMP version {} from {} to {}",
                 version, host_from, host_to
             );
             return Ok(());
@@ -76,6 +110,21 @@ impl SNMPProxyDispatcher {
             return Ok(());
         }
 
+        let hkey = HostKey::new(host_to, Bytes::copy_from_slice(community));
+        let now = Instant::now();
+
+        if let Some(blk) = self.ignorelist.read().get(&hkey).cloned() {
+            debug!(
+                "Host {} ignoring from {} ago (for {})",
+                hkey,
+                crate::config::Dur::from(now - blk),
+                self.cfg.ignore_duration
+            );
+            if (now - blk) < self.cfg.ignore_duration.dur() {
+                return Ok(());
+            }
+        }
+
         let mut pack_pdu = AsnReader::from_bytes(rdr.read_raw(ident)?);
         let req_id = pack_pdu.read_asn_integer()?;
         if req_id < i32::min_value() as i64 || req_id > i32::max_value() as i64 {
@@ -92,14 +141,6 @@ impl SNMPProxyDispatcher {
             return Err(snmp::SnmpError::ValueOutOfRange.into());
         }
 
-        let now = Instant::now();
-        let hkey = HostKey::new(host_to, Bytes::copy_from_slice(community));
-
-        if let Some(blk) = self.blacklist.read().get(&hkey).cloned() {
-            if (now - blk) < self.cfg.blacklist_duration.dur() {
-                return Ok(());
-            }
-        }
         if let Some(hostrec) = self.hosts.read().get(&hkey) {
             hostrec.1.send(Query::new(host_from, now, ident, buf))?;
             return Ok(());
@@ -126,11 +167,12 @@ impl SNMPProxyDispatcher {
         };
         Ok(())
     }
-    fn blacklist_host(&self, hkey: HostKey) {
+    fn ignore_host(&self, hkey: HostKey) {
+        debug!("Will ignore host {}", hkey);
         if let Some(hst) = self.hosts.write().remove(&hkey) {
             hst.3.cancel();
         }
-        self.blacklist.write().insert(hkey, Instant::now());
+        self.ignorelist.write().insert(hkey, Instant::now());
     }
     async fn process_query(
         self: Arc<Self>,
@@ -185,7 +227,6 @@ impl SNMPProxyDispatcher {
             let varbind_bytes = pack_pdu.read_raw(asn1::TYPE_SEQUENCE)?;
             let vbs = snmp::Varbinds::from_bytes(varbind_bytes);
             let mut reply = Vec::<(Vec<u32>, snmp::Value)>::new();
-            //session.getmulti(names, repeat, timeout)
             let mut to_query = Vec::<Vec<u32>>::new();
             for q in vbs {
                 let oid = q.0.read_name(&mut nmb)?.to_vec();
@@ -239,8 +280,7 @@ impl SNMPProxyDispatcher {
                         Err(e) => {
                             warn!("host {} snmp error {:?}", host_to, e);
                             if host.read().cache.is_empty() {
-                                warn!("Blacklist host {}", host_to);
-                                self.blacklist_host(host.read().key.clone());
+                                self.ignore_host(host.read().key.clone());
                                 return Ok(());
                             }
                         }
@@ -363,8 +403,7 @@ impl SNMPProxyDispatcher {
                         Err(e) => {
                             warn!("host {} snmp error {:?}", host_to, e);
                             if host.read().cache.is_empty() {
-                                warn!("Blacklist host {}", host_to);
-                                self.blacklist_host(host.read().key.clone());
+                                self.ignore_host(host.read().key.clone());
                                 return Ok(());
                             }
                         }
@@ -514,8 +553,7 @@ impl SNMPProxyDispatcher {
                         Err(e) => {
                             warn!("host {} snmp error {:?}", host_to, e);
                             if host.read().cache.is_empty() {
-                                warn!("Blacklist host {}", host_to);
-                                self.blacklist_host(host.read().key.clone());
+                                self.ignore_host(host.read().key.clone());
                                 return Ok(());
                             }
                         }
