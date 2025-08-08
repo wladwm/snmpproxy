@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddrV4;
 use std::time::Instant;
 
+pub fn match_oid(longer: &[u32], shorter: &[u32]) -> bool {
+    longer.len() >= shorter.len() && shorter == &longer[0..shorter.len()]
+}
+
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct HostKey {
     pub hostsocket: SocketAddrV4,

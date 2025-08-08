@@ -468,8 +468,20 @@ impl SNMPProxyDispatcher {
             let vbs = snmp::Varbinds::from_bytes(varbind_bytes);
             for (n, q) in vbs.enumerate() {
                 let oid = q.0.read_name(&mut nmb)?.to_vec();
+                let mut noid = oid.clone();
+                noid[oid.len() - 1] += 1;
                 if n < non_repeaters {
-                    if host.read().cache.get(&oid).is_none() {
+                    if host
+                        .read()
+                        .cache
+                        .range((
+                            std::ops::Bound::Included(oid.clone()),
+                            std::ops::Bound::Excluded(noid.clone()),
+                        ))
+                        .filter(|x| (x.1.when > old) && match_oid(x.0, &oid))
+                        .next()
+                        .is_none()
+                    {
                         to_query_nr.push(oid);
                     }
                 } else if let Some((_, v)) = host
@@ -477,10 +489,10 @@ impl SNMPProxyDispatcher {
                     .cache
                     .range((
                         std::ops::Bound::Included(oid.clone()),
-                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Excluded(noid.clone()),
                     ))
                     .next()
-                    .filter(|x| x.1.when > old)
+                    .filter(|x| (x.1.when > old) && match_oid(x.0, &oid))
                 {
                     if v.repeaters < max_repetitions {
                         to_query_r.push(oid);
@@ -504,26 +516,49 @@ impl SNMPProxyDispatcher {
                 to_query_nr.clear();
                 to_query_r.clear();
                 let vbs = snmp::Varbinds::from_bytes(varbind_bytes);
+                let mut act_non_reps = 0usize;
                 for (n, q) in vbs.enumerate() {
                     let oid = q.0.read_name(&mut nmb)?.to_vec();
+                    let mut noid = oid.clone();
+                    noid[oid.len() - 1] += 1;
                     if n < non_repeaters {
-                        if host.read().cache.get(&oid).is_none() {
+                        if host
+                            .read()
+                            .cache
+                            .range((
+                                std::ops::Bound::Included(oid.clone()),
+                                std::ops::Bound::Excluded(noid.clone()),
+                            ))
+                            .filter(|x| (x.1.when > old) && match_oid(x.0, &oid))
+                            .next()
+                            .is_none()
+                        {
+                            trace!("Not found cache non-rep {:?} for {}", oid, host_to);
                             to_query_nr.push(oid);
+                            act_non_reps += 1;
                         }
                     } else if let Some((_, v)) = host
                         .read()
                         .cache
                         .range((
                             std::ops::Bound::Included(oid.clone()),
-                            std::ops::Bound::Unbounded,
+                            std::ops::Bound::Excluded(noid.clone()),
                         ))
                         .next()
-                        .filter(|x| x.1.when > old)
+                        .filter(|x| (x.1.when > old) && match_oid(x.0, &oid))
                     {
                         if v.repeaters < max_repetitions {
+                            trace!(
+                                "Not found cache {:?}*{}<{} for {}",
+                                oid,
+                                v.repeaters,
+                                max_repetitions,
+                                host_to
+                            );
                             to_query_r.push(oid);
                         }
                     } else {
+                        trace!("Not found cache {:?} for {}", oid, host_to);
                         to_query_r.push(oid);
                     }
                 }
@@ -534,11 +569,19 @@ impl SNMPProxyDispatcher {
                         .zip(std::iter::repeat(max_repetitions))
                         .collect::<std::collections::BTreeMap<Vec<u32>, usize>>();
                     to_query_nr.append(&mut to_query_r);
+                    debug!(
+                        "Requesting getbulk {}/{}/{} varbinds from {} reqid {}",
+                        to_query_nr.len(),
+                        act_non_reps,
+                        max_repetitions,
+                        host_to,
+                        sguard.last_req_id()
+                    );
                     match tokio::select! {
                         r = sguard
                         .getbulk(
                             &to_query_nr,
-                            non_repeaters as u32,
+                            act_non_reps as u32,
                             max_repetitions as u32,
                             self.cfg.snmp_repeat,
                             self.cfg.snmp_timeout.dur(),
@@ -558,39 +601,53 @@ impl SNMPProxyDispatcher {
                             }
                         }
                         Ok(v) => {
-                            if v.error_index == 0 && v.error_status == 0 {
-                                let when = Instant::now();
-                                let mut hwr = host.write();
-                                for q in v.varbinds() {
-                                    let oid = match q.0.read_name(&mut nmb) {
-                                        Err(e) => {
-                                            warn!("Unable to read oid - {:?}", e);
-                                            continue;
-                                        }
-                                        Ok(v) => v,
-                                    };
-                                    let value = match crate::value::Value::try_from(&q.1) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            warn!(
-                                                "Unable to convert value for oid {:?} - {:?}",
-                                                oid, e
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    let mut vl = CachedValue::new(value, when);
-                                    match repeaters.get_mut(oid) {
-                                        None => {}
-                                        Some(v) => {
-                                            vl.repeaters = *v;
-                                            if *v > 0 {
-                                                *v -= 1;
+                            if v.error_index != 0 || v.error_status != 0 {
+                                debug!("getbulk got {} {}", v.error_index, v.error_status);
+                            }
+                            let when = Instant::now();
+                            let mut hwr = host.write();
+                            for q in v.varbinds() {
+                                let oid = match q.0.read_name(&mut nmb) {
+                                    Err(e) => {
+                                        warn!("Unable to read oid - {:?}", e);
+                                        continue;
+                                    }
+                                    Ok(v) => v,
+                                };
+                                let value = match crate::value::Value::try_from(&q.1) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        warn!(
+                                            "Unable to convert value for oid {:?} - {:?}",
+                                            oid, e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let mut vl = CachedValue::new(value, when);
+                                match repeaters
+                                    .iter_mut()
+                                    .filter(|(k, _)| match_oid(&oid, k))
+                                    .fold(None, |acc, (k, v)| match acc {
+                                        None => Some((k, v)),
+                                        Some(ref c) => {
+                                            if c.0.len() > k.len() {
+                                                acc
+                                            } else {
+                                                Some((k, v))
                                             }
                                         }
+                                    }) {
+                                    None => {}
+                                    Some(v) => {
+                                        vl.repeaters = *v.1;
+                                        if *v.1 > 0 {
+                                            *v.1 -= 1;
+                                        }
                                     }
-                                    hwr.cache.insert(oid.to_vec(), vl);
                                 }
+                                trace!("store {:?} {}", oid, q.1);
+                                hwr.cache.insert(oid.to_vec(), vl);
                             }
                         }
                     };
