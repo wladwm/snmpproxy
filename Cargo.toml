@@ -16,7 +16,7 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 mio = { version="1", features = ["os-poll","net"]}
 tokio = { version="1.47.1", features = ["full"] }
-tokio-util = { version = "0.7.16", features = [ "codec" ] }
+tokio-util = { version = "0.7.16" }
 bytes = "1.10.1"
 chrono = "0.4.23"
 log = "0.4.17"
@@ -24,7 +24,9 @@ pretty_env_logger = "0.5.0"
 anyhow = "1.0.98"
 socket2 = "0.6.0"
 parking_lot = "0.12.4"
-clap = { version="4.1.1", features = ["derive"] }
+clap = { version = "4.1.1", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1"
 snmp = { git = "https://github.com/wladwm/rust-snmp.git", rev = "d94c033e" }
 
 

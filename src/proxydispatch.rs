@@ -6,11 +6,13 @@ use bytes::Bytes;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+use tokio::io::AsyncWriteExt;
 
 use snmp::{asn1, AsnReader, SnmpMessageType};
 use std::collections::HashMap;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -33,6 +35,7 @@ pub struct SNMPProxyDispatcher {
     >,
     pub ignorelist: parking_lot::RwLock<HashMap<HostKey, Instant>>,
     pub socket: snmp::tokio_socket::SNMPSocket,
+    pub stats: crate::statistics::Stats,
 }
 
 impl SNMPProxyDispatcher {
@@ -77,6 +80,7 @@ impl SNMPProxyDispatcher {
             hosts: parking_lot::RwLock::new(HashMap::new()),
             ignorelist: parking_lot::RwLock::new(HashMap::new()),
             socket,
+            stats: Default::default(),
         })
     }
 
@@ -86,6 +90,7 @@ impl SNMPProxyDispatcher {
         host_from: SocketAddrV4,
         host_to: SocketAddrV4,
     ) -> Result<()> {
+        self.stats.packets_intercepted.fetch_add(1, SeqCst);
         let seq = AsnReader::from_bytes(&buf).read_raw(asn1::TYPE_SEQUENCE)?;
         let mut rdr = AsnReader::from_bytes(seq);
         let version = rdr.read_asn_integer()?;
@@ -103,6 +108,7 @@ impl SNMPProxyDispatcher {
             && message_type != SnmpMessageType::GetNextRequest
             && message_type != SnmpMessageType::GetBulkRequest
         {
+            self.stats.packets_in_others.fetch_add(1, SeqCst);
             warn!(
                 "Unsupported message type {:?} from {} to {}",
                 message_type, host_from, host_to
@@ -174,6 +180,18 @@ impl SNMPProxyDispatcher {
         }
         self.ignorelist.write().insert(hkey, Instant::now());
     }
+    pub async fn save_stats(&self) -> Result<()> {
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&self.cfg.stats_file)
+            .await?;
+        let r = serde_json::to_string(&self.stats)?;
+        f.write_all(r.as_bytes()).await?;
+        f.shutdown().await?;
+        Ok(())
+    }
     async fn process_query(
         self: Arc<Self>,
         host: Arc<parking_lot::RwLock<HostStore>>,
@@ -210,6 +228,7 @@ impl SNMPProxyDispatcher {
         let old = Instant::now() - self.cfg.cache_value_lifetime.dur();
 
         if message_type == SnmpMessageType::GetRequest {
+            self.stats.packets_in_get.fetch_add(1, SeqCst);
             let error_status = pack_pdu.read_asn_integer()?;
             if error_status < 0 || error_status > i32::max_value() as i64 {
                 return Ok(());
@@ -225,6 +244,9 @@ impl SNMPProxyDispatcher {
             }
 
             let varbind_bytes = pack_pdu.read_raw(asn1::TYPE_SEQUENCE)?;
+            self.stats
+                .varbinds_intercepted
+                .fetch_add(snmp::Varbinds::from_bytes(varbind_bytes).count(), SeqCst);
             let vbs = snmp::Varbinds::from_bytes(varbind_bytes);
             let mut reply = Vec::<(Vec<u32>, snmp::Value)>::new();
             let mut to_query = Vec::<Vec<u32>>::new();
@@ -267,6 +289,7 @@ impl SNMPProxyDispatcher {
                     }
                 }
                 if !to_query.is_empty() {
+                    self.stats.varbinds_sent.fetch_add(to_query.len(), SeqCst);
                     match tokio::select! {
                             r = sguard
                             .getmulti(&to_query, self.cfg.snmp_repeat, self.cfg.snmp_timeout.dur()) => r,
@@ -305,6 +328,9 @@ impl SNMPProxyDispatcher {
                         reply.push((oid, snmp::Value::NoSuchObject));
                     }
                 }
+                self.stats
+                    .varbinds_replied
+                    .fetch_add(snmp::Varbinds::from_bytes(varbind_bytes).count(), SeqCst);
                 debug!(
                     "use {} cached varbinds for reply from {} to {}",
                     cnt, host_to, query.src
@@ -325,9 +351,11 @@ impl SNMPProxyDispatcher {
                     host_to, query.src, e
                 );
             }
+            self.stats.packets_sent_get.fetch_add(1, SeqCst);
             return Ok(());
         }
         if message_type == SnmpMessageType::GetNextRequest {
+            self.stats.packets_in_getnext.fetch_add(1, SeqCst);
             let error_status = pack_pdu.read_asn_integer()?;
             if error_status < 0 || error_status > i32::max_value() as i64 {
                 return Ok(());
@@ -351,6 +379,7 @@ impl SNMPProxyDispatcher {
                 }
                 Some(v) => v,
             };
+            self.stats.varbinds_intercepted.fetch_add(1, SeqCst);
             let oid = q.0.read_name(&mut nmb)?.to_vec();
             if host
                 .read()
@@ -390,6 +419,7 @@ impl SNMPProxyDispatcher {
                         host_to,
                         sguard.last_req_id()
                     );
+                    self.stats.varbinds_sent.fetch_add(1, SeqCst);
                     match tokio::select! {
                             r = sguard
                             .getnext(&oid, self.cfg.snmp_repeat, self.cfg.snmp_timeout.dur()) => r,
@@ -443,6 +473,7 @@ impl SNMPProxyDispatcher {
                     (version + 1) as i32,
                 );
             }
+            self.stats.varbinds_replied.fetch_add(1, SeqCst);
             let bf = bytes::Bytes::copy_from_slice(&rbuf);
             debug!(
                 "Send getnext reply {} from {} to {}",
@@ -455,16 +486,21 @@ impl SNMPProxyDispatcher {
                     "Error sending getnext reply from {} to {} - {:?}",
                     host_to, query.src, e
                 );
-            }
+            };
+            self.stats.packets_sent_getnext.fetch_add(1, SeqCst);
             return Ok(());
         }
         if message_type == SnmpMessageType::GetBulkRequest {
+            self.stats.packets_in_getbulk.fetch_add(1, SeqCst);
             let non_repeaters = pack_pdu.read_asn_integer()? as usize;
             let max_repetitions = pack_pdu.read_asn_integer()? as usize;
             let varbind_bytes = pack_pdu.read_raw(asn1::TYPE_SEQUENCE)?;
             let mut to_query_nr = Vec::<Vec<u32>>::new();
             let mut to_query_r = Vec::<Vec<u32>>::new();
 
+            self.stats
+                .varbinds_intercepted
+                .fetch_add(snmp::Varbinds::from_bytes(varbind_bytes).count(), SeqCst);
             let vbs = snmp::Varbinds::from_bytes(varbind_bytes);
             for (n, q) in vbs.enumerate() {
                 let oid = q.0.read_name(&mut nmb)?.to_vec();
@@ -569,6 +605,9 @@ impl SNMPProxyDispatcher {
                         .zip(std::iter::repeat(max_repetitions))
                         .collect::<std::collections::BTreeMap<Vec<u32>, usize>>();
                     to_query_nr.append(&mut to_query_r);
+                    self.stats
+                        .varbinds_sent
+                        .fetch_add(to_query_nr.len(), SeqCst);
                     debug!(
                         "Requesting getbulk {}/{}/{} varbinds from {} reqid {}",
                         to_query_nr.len(),
@@ -684,6 +723,7 @@ impl SNMPProxyDispatcher {
                         }
                     }
                 }
+                self.stats.varbinds_replied.fetch_add(reply.len(), SeqCst);
                 snmp::pdu::build_response(
                     community,
                     req_id as i32,
@@ -705,6 +745,7 @@ impl SNMPProxyDispatcher {
                     host_to, query.src, e
                 );
             }
+            self.stats.replies_sent_getbulk.fetch_add(1, SeqCst);
             return Ok(());
         }
         Ok(())
@@ -722,7 +763,7 @@ impl SNMPProxyDispatcher {
         };
         let session = Arc::new(tokio::sync::Mutex::new(
             self.socket
-                .session(hto /* host_to */, &community, 10, 2)
+                .session(host_to, &community, 10, 2)
                 .await?,
         ));
         let active_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));

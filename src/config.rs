@@ -210,6 +210,12 @@ pub struct Config {
         default_value_t = 100
     )]
     pub max_parallel_queries_per_host: usize,
+    #[arg(
+        long,
+        help = "File to store statistics every 5 min or on SIGUSR1",
+        default_value = "stats.json"
+    )]
+    pub stats_file: String,
 }
 impl std::default::Default for Config {
     fn default() -> Self {
@@ -225,6 +231,7 @@ impl std::default::Default for Config {
             snmp_timeout: Dur::from_secs(10),
             snmp_repeat: 3,
             max_parallel_queries_per_host: 100,
+            stats_file: "stats.json".to_string(),
         }
     }
 }

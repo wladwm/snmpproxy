@@ -1,3 +1,4 @@
+use crate::anyhow::Context;
 use crate::config;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Socket, Type};
@@ -60,22 +61,42 @@ impl IUdpSocket {
         }
     }
     pub fn create(&mut self) -> std::io::Result<()> {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;
-        socket.set_reuse_address(true)?;
-        #[cfg(unix)]
-        socket.set_reuse_port(true)?;
-        socket.set_broadcast(true)?;
-        socket.set_multicast_loop_v4(true)?;
-        socket.set_nonblocking(true)?;
-        #[cfg(windows)]
+        #[cfg(target_os = "freebsd")]
         {
-            self.socket_raw = socket.into_raw_socket();
+            self.socket_raw = unsafe {
+                libc::socket(libc::AF_INET, libc::SOCK_RAW, 258 /* IPPROTO_DIVERT */)
+            };
+            if self.socket_raw < 0 {
+                let errno = sys_errno();
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            unsafe {
+                libc::fcntl(
+                    self.socket_raw,
+                    libc::F_SETFL,
+                    libc::fcntl(self.socket_raw, libc::F_GETFL, 0) | libc::O_NONBLOCK,
+                );
+            }
         }
-        #[cfg(unix)]
+        #[cfg(not(target_os = "freebsd"))]
         {
-            self.socket_raw = socket.into_raw_fd();
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            socket.set_reuse_address(true)?;
+            #[cfg(unix)]
+            socket.set_reuse_port(true)?;
+            socket.set_broadcast(true)?;
+            socket.set_multicast_loop_v4(true)?;
+            socket.set_nonblocking(true)?;
+            #[cfg(windows)]
+            {
+                self.socket_raw = socket.into_raw_socket();
+            }
+            #[cfg(unix)]
+            {
+                self.socket_raw = socket.into_raw_fd();
+            }
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         unsafe {
             let v = 1u32;
             let scko = libc::setsockopt(
@@ -93,7 +114,7 @@ impl IUdpSocket {
                 );
             }
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         unsafe {
             let v = 1u32;
             let scko = libc::setsockopt(
@@ -255,7 +276,53 @@ impl IUdpSocket {
                         as *mut libc::cmsghdr;
                 }
             }
-            let mut trg = ipfrominaddr(&ctrl.ipi_addr);
+            #[cfg(target_os = "freebsd")]
+            {
+                //got packet via DIVERT with header
+                #[repr(C, packed(1))]
+                struct UdpHdr {
+                    iph_ver: u8, //0x45
+                    iph_tos: u8,
+                    iph_len: u16,
+                    iph_ident: u16,
+                    iph_offset_flags: u16,
+                    iph_ttl: u8,
+                    iph_protocol: u8,
+                    iph_chksum: u16,
+                    iph_sourceip: u32,
+                    iph_destip: u32,
+                    udph_srcport: u16,
+                    udph_dstport: u16,
+                    udph_len: u16,
+                    udph_cksum: u16,
+                }
+                let hdr = unsafe { &mut *(readbuf.as_mut_ptr() as *mut UdpHdr) };
+                if hdr.iph_ver == 0x45 && hdr.iph_offset_flags | 64 == 64 && hdr.iph_protocol == 17
+                {
+                    // UDP header found
+                    let afrom = SocketAddrV4::new(
+                        Ipv4Addr::from(u32::from_be(hdr.iph_sourceip)),
+                        u16::from_be(hdr.udph_srcport),
+                    );
+                    let ato = SocketAddrV4::new(
+                        Ipv4Addr::from(u32::from_be(hdr.iph_destip)),
+                        u16::from_be(hdr.udph_dstport),
+                    );
+                    // strip header
+                    //readbuf[0..(ssz as usize) - std::mem::size_of::<UdpHdr>()].copy_from_slice(&readbuf[std::mem::size_of::<UdpHdr>()..(ssz as usize)]);
+                    unsafe {
+                        std::ptr::copy(
+                            readbuf
+                                .as_ptr()
+                                .offset(std::mem::size_of::<UdpHdr>() as isize),
+                            readbuf.as_mut_ptr(),
+                            (ssz as usize) - std::mem::size_of::<UdpHdr>(),
+                        )
+                    };
+                    return Ok(((ssz as usize) - std::mem::size_of::<UdpHdr>(), afrom, ato));
+                }
+            }
+
             return Ok((
                 ssz as usize,
                 SocketAddrV4::new(
@@ -450,14 +517,16 @@ pub fn recv_loop(
     sockcfg: &config::SocketConfig,
 ) -> anyhow::Result<()> {
     let mut sock = IUdpSocket::new();
-    sock.create()?;
-    sock.bind(SocketAddrV4::new(sockcfg.bind_address, sockcfg.bind_port))?;
+    sock.create().context("Create intercept socket")?;
+    sock.bind(SocketAddrV4::new(sockcfg.bind_address, sockcfg.bind_port))
+        .context("Bind intercept socket")?;
     let mut buf = [0u8; 1500];
-    let mut poll = Poll::new()?;
+    let mut poll = Poll::new().context("Create poll")?;
     let mut events = Events::with_capacity(1);
     let polltimeout = std::time::Duration::from_millis(1000);
     poll.registry()
-        .register(&mut sock, Token(0), Interest::READABLE)?;
+        .register(&mut sock, Token(0), Interest::READABLE)
+        .context("register intercept socket")?;
     while !cancel.is_cancelled() {
         match sock.recvfromto(&mut buf) {
             Ok(rs) => {
@@ -476,7 +545,7 @@ pub fn recv_loop(
                         trace!("poll timeout");
                         continue;
                     }
-                    return Err(err.into());
+                    return Err(Into::<anyhow::Error>::into(err).context("recvfromto"));
                 }
             }
         }

@@ -110,7 +110,7 @@ impl SpoofSocket {
         {
             sraw = sock2.into_raw_fd();
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         unsafe {
             let v = 1u32;
             let scko = libc::setsockopt(
